@@ -1,30 +1,14 @@
-(semester: ImprovingU.Semester, user: Jinaga.User) {
-    catalog: ImprovingU.Catalog [
-        catalog->_in:ImprovingU.Semester = semester
+(user: DWS.USER) {
+    worker:DWS.WORKER [
+        worker->user:DWS.USER = user
     ]
-    course: ImprovingU.Course [
-        course->_in:ImprovingU.Catalog = catalog
+    username:DWS.USER.NAME [
+        username->user:DWS.USER = user
         !E {
-            delete: ImprovingU.Course.Delete [
-                delete->course:ImprovingU.Course = course
-            ]
+             prior:DWS.USER.NAME [
+                prior->username:DWS.USER.NAME = username
+             ]
         }
     ]
-} => {
-    titles = {
-        title: ImprovingU.Course.Title [
-            title->course: ImprovingU.Course = course
-        ]
-    }
-    registrations = {
-        registration: ImprovingU.Course.Registration [
-            registration->course:ImprovingU.Course = course
-            registration->student:Jinaga.User = user
-            !E {
-                delete: ImprovingU.Course.Registration.Deletion [
-                    delete->courseRegistration:ImprovingU.Course.Registration = registration
-                ]
-            }
-        ]
-    }
-}
+
+} 
