@@ -1,14 +1,13 @@
-import { expect } from "chai";
 import { dehydrateReference, dehydrateFact } from "../../src/fact/hydrate";
-import { FeedImpl } from "../../src/feed/feed-impl";
-import { runService } from "../../src/feed/service";
+import { ObservableSourceImpl } from "../../src/observable/observable-source-impl";
+import { runService } from "../../src/observable/service";
 import { MemoryStore } from "../../src/memory/memory-store";
 import { fromDescriptiveString } from "../../src/query/descriptive-string";
 import { ServiceRunner } from "../../src/util/serviceRunner";
 
 class TestContext {
     private store = new MemoryStore();
-    private feed = new FeedImpl(this.store);
+    private feed = new ObservableSourceImpl(this.store);
     private exceptions: any[] = [];
     private serviceRunner = new ServiceRunner(exception => this.exceptions.push(exception.message));
 
@@ -26,7 +25,9 @@ class TestContext {
             await subscription.load();
         }
         catch (exception) {
-            this.exceptions.push(exception.message);
+            if (exception instanceof Error) {
+                this.exceptions.push(exception.message);
+            }
         }
     }
 
@@ -35,11 +36,11 @@ class TestContext {
     }
 
     expectNoExceptions() {
-        expect(this.exceptions).to.deep.equal([]);
+        expect(this.exceptions).toEqual([]);
     }
 
     expectExceptions(expected: string[]) {
-        expect(this.exceptions).to.deep.equal(expected);
+        expect(this.exceptions).toEqual(expected);
     }
 }
 
@@ -55,7 +56,7 @@ describe('Service', () => {
         await context.run(start, 'S.parent F.type="Child"', async _ => { ++runs; });
         await context.stop();
         context.expectNoExceptions();
-        expect(runs).to.equal(0);
+        expect(runs).toEqual(0);
     });
 
     it('should run for existing fact', async () => {
@@ -79,7 +80,7 @@ describe('Service', () => {
         });
         await context.stop();
         context.expectNoExceptions();
-        expect(runs).to.equal(1);
+        expect(runs).toEqual(1);
     });
 
     it('should run for new fact', async () => {
@@ -103,7 +104,7 @@ describe('Service', () => {
         });
         await context.stop();
         context.expectNoExceptions();
-        expect(runs).to.equal(1);
+        expect(runs).toEqual(1);
     });
 
     it('should fail if handler does not remove fact', async () => {
@@ -125,6 +126,6 @@ describe('Service', () => {
         context.expectExceptions([
             'The handler did not remove the processed message from the query \'S.parent F.type="Child" N(S.child F.type="Handled")\'. This process will be duplicated the next time the service is run.'
         ]);
-        expect(runs).to.equal(1);
+        expect(runs).toEqual(1);
     });
 });

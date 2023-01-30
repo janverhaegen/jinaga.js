@@ -1,11 +1,13 @@
 import { Authentication } from './authentication/authentication';
 import { dehydrateReference, Dehydration, HashMap, hydrate, hydrateFromTree, lookupHash } from './fact/hydrate';
-import { runService } from './feed/service';
 import { SyncStatus, SyncStatusNotifier } from './http/web-client';
-import { MemoryStore } from './memory/memory-store';
+import { runService } from './observable/service';
+import { ObservableCollection, Observer, ObserverImpl, ResultAddedFunc } from './observer/observer';
 import { Query } from './query/query';
-import { Condition, ensure, FactDescription, Preposition, Specification } from './query/query-parser';
-import { FactEnvelope, FactPath, uniqueFactReferences } from './storage';
+import { ConditionOf, ensure, FactDescription, Preposition, SpecificationOf as OldSpecificationOf } from './query/query-parser';
+import { SpecificationOf } from './specification/given';
+import { Projection } from './specification/specification';
+import { FactEnvelope, FactPath, ProjectedResult, uniqueFactReferences } from './storage';
 import { Subscription } from "./subscription/subscription";
 import { SubscriptionImpl } from "./subscription/subscription-impl";
 import { SubscriptionNoOp } from "./subscription/subscription-no-op";
@@ -23,6 +25,13 @@ export interface Profile {
 
 export { Trace, Tracer, Preposition, FactDescription, ensure, Template };
 
+type MakeObservable<T> =
+    T extends Array<infer U> ? ObservableCollection<MakeObservable<U>> :
+    T extends { [key: string]: unknown } ? { [K in keyof T]: MakeObservable<T[K]> } :
+    T;
+
+type WatchArgs<T extends unknown[], U> = [...T, ResultAddedFunc<MakeObservable<U>>];
+
 export class Jinaga {
     private errorHandlers: ((message: string) => void)[] = [];
     private loadingHandlers: ((loading: boolean) => void)[] = [];
@@ -31,8 +40,7 @@ export class Jinaga {
     
     constructor(
         private authentication: Authentication,
-        private store: MemoryStore,
-        private syncStatusNotifier: SyncStatusNotifier
+        private syncStatusNotifier: SyncStatusNotifier | null
     ) { }
 
     /**
@@ -64,7 +72,7 @@ export class Jinaga {
     }
 
     onSyncStatus(handler: (status: SyncStatus) => void) {
-        this.syncStatusNotifier.onSyncStatus(handler);
+        this.syncStatusNotifier?.onSyncStatus(handler);
     }
 
     /**
@@ -103,7 +111,7 @@ export class Jinaga {
      */
     async fact<T>(prototype: T) : Promise<T> {
         if (!prototype) {
-            return null;
+            return prototype;
         }
         try {
             this.validateFact(prototype);
@@ -132,7 +140,25 @@ export class Jinaga {
      * @param preposition A template function passed into j.for
      * @returns A promise that resolves to an array of results
      */
-    async query<T, U>(start: T, preposition: Preposition<T, U>) : Promise<U[]> {
+    query<T, U>(start: T, preposition: Preposition<T, U>) : Promise<U[]>;
+    /**
+     * Execute a query for facts matching a specification.
+     * 
+     * @param specification Use Model.given().match() to create a specification
+     * @param given The fact or facts from which to begin the query
+     * @returns A promise that resolves to an array of results
+     */
+    query<T extends unknown[], U>(specification: SpecificationOf<T, U>, ...given: T): Promise<U[]>;
+    query(first: any, ...rest: any[]): Promise<any[]> {
+        if (rest.length === 1 && rest[0] instanceof Preposition) {
+            return this.oldQuery(first, rest[0]);
+        }
+        else {
+            return this.newQuery(first, ...rest);
+        }
+    }
+
+    private async oldQuery<T, U>(start: T, preposition: Preposition<T, U>) : Promise<U[]> {
         if (!start) {
             return [];
         }
@@ -149,6 +175,25 @@ export class Jinaga {
 
         const facts = await this.authentication.load(uniqueReferences);
         return hydrateFromTree(uniqueReferences, facts);
+    }
+
+    private async newQuery<T extends unknown[], U>(specification: SpecificationOf<T, U>, ...given: T): Promise<U[]> {
+        const innerSpecification = specification.specification;
+
+        if (!given || given.some(g => !g)) {
+            return [];
+        }
+        if (given.length !== innerSpecification.given.length) {
+            throw new Error(`Expected ${innerSpecification.given.length} given facts, but received ${given.length}.`);
+        }
+
+        const references = given.map(g => {
+            const fact = JSON.parse(JSON.stringify(g));
+            this.validateFact(fact);
+            return dehydrateReference(fact);
+        });
+        const projectedResults = await this.authentication.read(references, innerSpecification);
+        return extractResults(projectedResults, innerSpecification.projection);
     }
 
     /**
@@ -181,7 +226,20 @@ export class Jinaga {
         start: T,
         preposition: Preposition<T, U>,
         resultAdded: (result: U) => void) : Watch<U, V>;
-    watch<T, U, V>(
+    watch<T extends unknown[], U>(specification: SpecificationOf<T, U>, ...args: WatchArgs<T, U>): Observer<U>;
+    watch(...args: any[]): any {
+        if (args.length === 3 && args[1] instanceof Preposition) {
+            return this.oldWatch(args[0], args[1], args[2]);
+        }
+        else if (args.length === 4 && args[1] instanceof Preposition) {
+            return this.oldWatch(args[0], args[1], args[2], args[3]);
+        }
+        else {
+            return this.newWatch(args[0], ...args.slice(1, args.length-1), args[args.length-1]);
+        }
+    }
+
+    private oldWatch<T, U, V>(
         start: T,
         preposition: Preposition<T, U>,
         resultAdded: (fact: U) => (V | void),
@@ -194,13 +252,42 @@ export class Jinaga {
         this.validateFact(fact);
         const reference = dehydrateReference(fact);
         const query = new Query(preposition.steps);
-        const onResultAdded = (path: FactPath, fact: U, take: ((model: V) => void)) => {
+        const onResultAdded = (path: FactPath, fact: U, take: ((model: V | null) => void)) => {
             const model = resultAdded(fact);
             take(resultRemoved ? <V>model : null);
         };
         const watch = new WatchImpl<U, V>(reference, query, onResultAdded, resultRemoved, this.authentication);
         watch.begin();
         return watch;
+    }
+
+    private newWatch<T extends unknown[], U>(specification: SpecificationOf<T, U>, ...args: WatchArgs<T, U>): Observer<U> {
+        const given: T = args.slice(0, args.length - 1) as T;
+        const resultAdded = args[args.length - 1] as ResultAddedFunc<U>;
+        const innerSpecification = specification.specification;
+
+        if (!given) {
+            throw new Error("No given facts provided.");
+        }
+        if (given.some(g => !g)) {
+            throw new Error("One or more given facts are null.");
+        }
+        if (!resultAdded || typeof resultAdded !== "function") {
+            throw new Error("No resultAdded function provided.");
+        }
+        if (given.length !== innerSpecification.given.length) {
+            throw new Error(`Expected ${innerSpecification.given.length} given facts, but received ${given.length}.`);
+        }
+
+        const references = given.map(g => {
+            const fact = JSON.parse(JSON.stringify(g));
+            this.validateFact(fact);
+            return dehydrateReference(fact);
+        });
+
+        const observer = new ObserverImpl<U>(this.authentication, references, innerSpecification, resultAdded);
+        observer.start();
+        return observer;
     }
 
     /**
@@ -255,7 +342,7 @@ export class Jinaga {
      * @param specification A template function, which returns j.match
      * @returns A preposition that can be passed to query or watch, or used to construct a preposition chain
      */
-    static for<T, U>(specification: (target : T) => Specification<U>) : Preposition<T, U> {
+    static for<T, U>(specification: (target : T) => OldSpecificationOf<U>) : Preposition<T, U> {
         return Preposition.for(specification);
     }
 
@@ -265,7 +352,7 @@ export class Jinaga {
      * @param specification A template function, which returns j.match
      * @returns A preposition that can be passed to query or watch, or used to construct a preposition chain
      */
-    for<T, U>(specification: (target : T) => Specification<U>) : Preposition<T, U> {
+    for<T, U>(specification: (target : T) => OldSpecificationOf<U>) : Preposition<T, U> {
         return Jinaga.for(specification);
     }
 
@@ -275,8 +362,8 @@ export class Jinaga {
      * @param template A JSON object with the desired type and predecessors
      * @returns A specification that can be used by query or watch
      */
-    static match<T>(template: Template<T>): Specification<T> {
-        return new Specification<T>(template,[]);
+    static match<T>(template: Template<T>): OldSpecificationOf<T> {
+        return new OldSpecificationOf<T>(template,[]);
     }
 
     /**
@@ -285,7 +372,7 @@ export class Jinaga {
      * @param template A JSON object with the desired type and predecessors
      * @returns A specification that can be used by query or watch
      */
-    match<T>(template: Template<T>): Specification<T> {
+    match<T>(template: Template<T>): OldSpecificationOf<T> {
         return Jinaga.match(template);
     }
 
@@ -295,8 +382,8 @@ export class Jinaga {
      * @param template A JSON object with the desired type and predecessors
      * @returns A condition that can be used in suchThat or not
      */
-    static exists<T>(template: Template<T>): Condition<T> {
-        return new Condition<T>(template, [], false);
+    static exists<T>(template: Template<T>): ConditionOf<T> {
+        return new ConditionOf<T>(template, [], false);
     }
 
     /**
@@ -305,7 +392,7 @@ export class Jinaga {
      * @param template A JSON object with the desired type and predecessors
      * @returns A condition that can be used in suchThat or not
      */
-    exists<T>(template: Template<T>): Condition<T> {
+    exists<T>(template: Template<T>): ConditionOf<T> {
         return Jinaga.exists(template);
     }
 
@@ -315,8 +402,8 @@ export class Jinaga {
      * @param template A JSON object with the desired type and predecessors
      * @returns A condition that can be used in suchThat or not
      */
-    static notExists<T>(template: Template<T>): Condition<T> {
-        return new Condition<T>(template, [], true);
+    static notExists<T>(template: Template<T>): ConditionOf<T> {
+        return new ConditionOf<T>(template, [], true);
     }
 
     /**
@@ -325,7 +412,7 @@ export class Jinaga {
      * @param template A JSON object with the desired type and predecessors
      * @returns A condition that can be used in suchThat or not
      */
-    notExists<T>(template: Template<T>): Condition<T> {
+    notExists<T>(template: Template<T>): ConditionOf<T> {
         return Jinaga.notExists(template);
     }
 
@@ -335,10 +422,10 @@ export class Jinaga {
      * @param condition A template function using exists or notExists to invert
      * @returns The opposite condition
      */
-    static not<T, U>(condition: (target: T) => Condition<U>) : (target: T) => Condition<U> {
+    static not<T, U>(condition: (target: T) => ConditionOf<U>) : (target: T) => ConditionOf<U> {
         return target => {
             const original = condition(target);
-            return new Condition<U>(original.template, original.conditions, !original.negative);
+            return new ConditionOf<U>(original.template, original.conditions, !original.negative);
         };
     }
 
@@ -348,11 +435,11 @@ export class Jinaga {
      * @param condition A template function using exists or notExists to invert
      * @returns The opposite condition
      */
-    not<T, U>(condition: (target: T) => Condition<U>) : (target: T) => Condition<U> {
+    not<T, U>(condition: (target: T) => ConditionOf<U>) : (target: T) => ConditionOf<U> {
         return Jinaga.not(condition);
     }
 
-    static hash<T>(fact: T) {
+    static hash<T extends Object>(fact: T) {
         const hash = lookupHash(fact);
         if (hash) {
             return hash;
@@ -361,28 +448,8 @@ export class Jinaga {
         return reference.hash;
     }
 
-    hash<T>(fact: T) {
+    hash<T extends Object>(fact: T) {
         return Jinaga.hash(fact);
-    }
-
-    /**
-     * Generate a diagram of all facts in memory.
-     * The diagram is written in the DOT graph language.
-     * Use graphviz.org to visualize the diagram.
-     * 
-     * @returns A DOT diagram of facts in memory
-     */
-    graphviz(): string {
-        return this.store.graphviz().join('\n');
-    }
-
-    /**
-     * Open an inspector in the browser's console window to navigate through facts in memory.
-     * 
-     * @returns An inspector listing all facts
-     */
-    inspect() {
-        return this.store.inspect();
     }
 
     private validateFact(prototype: HashMap) {
@@ -416,4 +483,26 @@ export class Jinaga {
             errorHandler(error);
         });
     }
+}
+
+function extractResults(projectedResults: ProjectedResult[], projection: Projection) {
+    const results = [];
+    for (const projectedResult of projectedResults) {
+        let result = projectedResult.result;
+        if (projection.type === "composite") {
+            const obj: any = {};
+            for (const component of projection.components) {
+                const value = result[component.name];
+                if (component.type === "specification") {
+                    obj[component.name] = extractResults(value, component.projection);
+                }
+                else {
+                    obj[component.name] = value;
+                }
+            }
+            result = obj;
+        }
+        results.push(result);
+    }
+    return results;
 }

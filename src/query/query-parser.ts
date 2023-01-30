@@ -5,7 +5,7 @@ interface Proxy {
     has(name: string, type: string): Proxy;
 }
 
-export class Specification<T> {
+export class SpecificationOf<T> {
     public existential = false;
     public specification = true;
 
@@ -14,12 +14,12 @@ export class Specification<T> {
         public conditions: Step[]
     ) {}
 
-    suchThat<U>(condition: (target: T) => Condition<U>): Specification<T> {
-        return new Specification<T>(this.template, this.conditions.concat(parseTemplate(condition)));
+    suchThat<U>(condition: (target: T) => ConditionOf<U>): SpecificationOf<T> {
+        return new SpecificationOf<T>(this.template, this.conditions.concat(parseTemplate(condition)));
     }
 }
 
-export class Condition<T> {
+export class ConditionOf<T> {
     public existential = true;
 
     constructor (
@@ -28,8 +28,8 @@ export class Condition<T> {
         public negative: boolean
     ) {}
 
-    suchThat<U>(condition: ((target: T) => Condition<U>)): Condition<T> {
-        return new Condition<T>(this.template, this.conditions.concat(parseTemplate(condition)), this.negative);
+    suchThat<U>(condition: ((target: T) => ConditionOf<U>)): ConditionOf<T> {
+        return new ConditionOf<T>(this.template, this.conditions.concat(parseTemplate(condition)), this.negative);
     }
 }
 
@@ -44,19 +44,19 @@ export class Preposition<T, U> {
      * @param specification A template function, which returns j.match
      * @returns A preposition that can be passed to query or watch, or used to construct a preposition chain
      */
-    then<V>(specification: (target : U) => Specification<V>): Preposition<T, V> {
+    then<V>(specification: (target : U) => SpecificationOf<V>): Preposition<T, V> {
         return new Preposition<T, V>(this.steps.concat(parseTemplate(specification)));
     }
 
-    static for<T, U>(specification: (target : T) => Specification<U>): Preposition<T, U> {
+    static for<T, U>(specification: (target : T) => SpecificationOf<U>): Preposition<T, U> {
         return new Preposition<T, U>(parseTemplate(specification));
     }
 }
 
 class ParserProxy implements Proxy {
     constructor(
-        private __parent: ParserProxy,
-        private __role: string) {
+        private __parent: ParserProxy | null,
+        private __role: string | null) {
     }
 
     [key:string]: any;
@@ -79,7 +79,7 @@ class ParserProxy implements Proxy {
                 currentSteps.push(new PropertyCondition(name, value));
             }
         }
-        if (this.__parent) {
+        if (this.__parent && this.__role) {
             const steps = this.__parent.createQuery();
             const step: Step = new Join(Direction.Predecessor, this.__role);
             steps.push(step);
@@ -91,7 +91,7 @@ class ParserProxy implements Proxy {
     }
 }
 
-function findTarget(spec:any): Array<Step> {
+function findTarget(spec:any): Array<Step> | null {
     if (spec instanceof ParserProxy) {
         return spec.createQuery();
     }
@@ -100,7 +100,7 @@ function findTarget(spec:any): Array<Step> {
     }
     if (spec instanceof Object) {
         const steps: Array<Step> = [];
-        let targetQuery: Array<Step> = null;
+        let targetQuery: Array<Step> | null = null;
         for (const field in spec) {
             if (!targetQuery) {
                 targetQuery = findTarget(spec[field]);
@@ -128,7 +128,13 @@ function findTarget(spec:any): Array<Step> {
 function parseTemplate(template: (target: any) => any): Step[] {
     const target = new ParserProxy(null, null);
     const spec = template(target);
+    if (!spec) {
+        throw new Error(`It looks like you didn't return j.match from the template function ${template.name}.`);
+    }
     const targetJoins = findTarget(spec.template);
+    if (!targetJoins) {
+        throw new Error(`I can't find where you used the parameter in template function ${template.name}.`);
+    }
     const steps = targetJoins.concat(spec.conditions);
 
     if (spec.existential) {

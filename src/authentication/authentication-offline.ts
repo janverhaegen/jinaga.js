@@ -1,11 +1,13 @@
-import { Feed, Observable } from '../feed/feed';
 import { Channel } from "../fork/channel";
 import { Fork } from "../fork/fork";
 import { LoginResponse } from '../http/messages';
 import { WebClient } from '../http/web-client';
 import { IndexedDBLoginStore } from '../indexeddb/indexeddb-login-store';
+import { Observable, SpecificationListener } from '../observable/observable';
 import { Query } from '../query/query';
-import { FactEnvelope, FactRecord, FactReference } from '../storage';
+import { Feed } from "../specification/feed";
+import { Specification } from "../specification/specification";
+import { FactEnvelope, FactFeed, FactRecord, FactReference, ProjectedResult } from '../storage';
 import { Authentication } from './authentication';
 
 export class AuthenticationOffline implements Authentication {
@@ -46,6 +48,14 @@ export class AuthenticationOffline implements Authentication {
     return this.inner.query(start, query);
   }
 
+  read(start: FactReference[], specification: Specification): Promise<ProjectedResult[]> {
+    return this.inner.read(start, specification);
+  }
+
+  feed(feed: Feed, bookmark: string): Promise<FactFeed> {
+    return this.inner.feed(feed, bookmark);
+  }
+
   whichExist(references: FactReference[]): Promise<FactReference[]> {
       throw new Error("whichExist method not implemented on AuthenticationImpl.");
   }
@@ -56,6 +66,14 @@ export class AuthenticationOffline implements Authentication {
 
   from(fact: FactReference, query: Query): Observable {
     return this.inner.from(fact, query);
+  }
+
+  addSpecificationListener(specification: Specification, onResult: (results: ProjectedResult[]) => Promise<void>) {
+    return this.inner.addSpecificationListener(specification, onResult);
+  }
+
+  removeSpecificationListener(listener: SpecificationListener) {
+      return this.inner.removeSpecificationListener(listener);
   }
 
   addChannel(fact: FactReference, query: Query): Channel {
